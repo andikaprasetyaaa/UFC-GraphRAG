@@ -1,6 +1,6 @@
 # UFC GraphRAG — UFC Fight Database
 
-**UFDC GraphRAG** is a Graph-enhanced Retrieval-Augmented Generation system
+**UFC GraphRAG** is a Graph-enhanced Retrieval-Augmented Generation system
 built on UFC fight data (`data/master.csv`, 11,441 fights). It combines:
 
 - Hybrid retrieval: local sentence-transformers embeddings with FAISS combined
