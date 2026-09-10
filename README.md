@@ -1,235 +1,219 @@
 # UFDC GraphRAG — UFC Fight Database
 
-Sistem **GraphRAG** (Graph-enhanced Retrieval-Augmented Generation) di atas
-data pertandingan UFC (`data/master.csv`, 11.441 laga). Menggabungkan:
+**UFDC GraphRAG** is a Graph-enhanced Retrieval-Augmented Generation system
+built on UFC fight data (`data/master.csv`, 11,441 fights). It combines:
 
-- 🔎 **Hybrid retrieval**: pencarian **vektor/semantik** (FAISS + embedding
-  sentence-transformers lokal) digabung dengan pencarian **leksikal/kata-kunci** (BM25) memakai
-  **Reciprocal Rank Fusion (RRF)**.
-- 🕸️ **Knowledge graph** (NetworkX) berisi relasi Fighter ↔ Fight ↔ Event,
-  dipakai untuk (a) **memperkaya konteks** hasil retrieval (graph expansion)
-  dan (b) menjawab pertanyaan **head-to-head** secara **eksak**, tanpa
-  LLM perlu "mengingat" atau menghitung sendiri.
-- 🧠 **LangChain** sebagai lapisan orkestrasi (LCEL chain) + **Gemini API**
-  (`langchain-google-genai`) untuk generasi jawaban. Embedding tidak memakai Gemini.
-- ⚡ **Cache 3 lapis** (semantic query cache, LLM exact-prompt cache,
-  embedding cache) supaya hemat biaya & latensi pada pertanyaan berulang.
+- Hybrid retrieval: local sentence-transformers embeddings with FAISS combined
+  with BM25 lexical search using Reciprocal Rank Fusion (RRF).
+- A NetworkX knowledge graph connecting Fighter, Fight, and Event entities. It
+  enriches retrieved context and answers head-to-head questions exactly.
+- LangChain orchestration with Gemini API (`langchain-google-genai`) for answer
+  generation. Embeddings do not use Gemini.
+- Three cache layers for semantic queries, exact LLM prompts, and embeddings.
 
-Dibuat & diuji dengan `langchain` 1.4.x / `langchain-google-genai` 4.4.x
-(per September 2026). Dokumentasi terstruktur tersedia di [`docs/`](docs/README.md).
+Built and tested with `langchain` 1.4.x and `langchain-google-genai` 4.4.x
+(as of September 2026). Structured documentation is available in
+[`docs/`](docs/README.md).
 
 ---
 
-## Arsitektur
+## Architecture
 
 ```mermaid
 flowchart TD
-    CSV[master.csv - 11.441 laga UFC] --> DL[data_loader.py]
-    DL -->|dokumen per-FIGHT| DOCS[(Documents)]
-    DL -->|dokumen per-FIGHTER profil karier| DOCS
+    CSV[master.csv - 11,441 UFC fights] --> DL[data_loader.py]
+    DL -->|fight documents| DOCS[(Documents)]
+    DL -->|fighter profile documents| DOCS
     CSV --> GB[graph_builder.py]
     GB --> GRAPH[(Knowledge Graph<br/>NetworkX MultiDiGraph)]
 
     DOCS -->|embed via sentence-transformers + cache L3| FAISS[(FAISS Vector Index)]
     DOCS -->|tokenize| BM25[(BM25 Index)]
 
-    Q[Pertanyaan user] --> QEMBED[Embed pertanyaan]
-    QEMBED --> L1{L1: Semantic<br/>Cache hit?}
-    L1 -- ya --> ANSWER[Jawaban langsung]
-    L1 -- tidak --> HYBRID[GraphRAGHybridRetriever]
+    Q[User question] --> QEMBED[Embed question]
+    QEMBED --> L1{L1: Semantic<br/>cache hit?}
+    L1 -- yes --> ANSWER[Direct answer]
+    L1 -- no --> HYBRID[GraphRAGHybridRetriever]
 
     FAISS --> HYBRID
     BM25 --> HYBRID
-    HYBRID -->|Reciprocal Rank Fusion| FUSED[Top-N dokumen]
-    FUSED -->|entitas fighter yang disebut| GRAPH
-    GRAPH -->|graph expansion: laga terbaru fighter terkait| FUSED
+    HYBRID -->|Reciprocal Rank Fusion| FUSED[Top-N documents]
+    FUSED -->|mentioned fighter entities| GRAPH
+    GRAPH -->|graph expansion: recent related fights| FUSED
 
-    Q --> GQA[graph_qa.py: deteksi 2 nama fighter?]
-    GQA -->|ya| H2H[Fakta head-to-head EKSAK dari graph]
+    Q --> GQA[graph_qa.py: detect two fighters]
+    GQA -->|yes| H2H[Exact head-to-head facts from graph]
     H2H --> PROMPT
-    FUSED --> PROMPT[Prompt + konteks]
+    FUSED --> PROMPT[Prompt + context]
     PROMPT --> L2{L2: SQLiteCache<br/>exact prompt?}
-    L2 -- tidak --> GEMINI[Gemini Chat Model]
-    L2 -- ya --> ANSWER
+    L2 -- no --> GEMINI[Gemini Chat Model]
+    L2 -- yes --> ANSWER
     GEMINI --> ANSWER
-    ANSWER --> STORE[Simpan ke Semantic Cache]
+    ANSWER --> STORE[Store in semantic cache]
 ```
 
-### Kenapa hybrid, bukan vektor saja?
+### Why hybrid retrieval instead of vector search alone?
 
-- **Vektor (FAISS)** unggul menangkap **makna**: "siapa petinju bertangan
-  kidal yang jago bertahan takedown" walau kata-katanya tidak persis sama
-  dengan dokumen.
-- **BM25** unggul untuk **istilah eksak**: nama orang, nama event, istilah
-  teknik ("guillotine", "spinning backfist") yang seringkali kurang
-  "menonjol" secara embedding tapi krusial secara leksikal.
-- **RRF** (bukan sekadar rata-rata skor) dipakai karena skala skor cosine
-  similarity vs BM25 tidak sepadan — RRF menggabungkan berdasarkan
-  **peringkat**, bukan nilai skor mentah, sehingga lebih robust.
+- **FAISS** is strong at semantic meaning, even when the query wording does
+  not exactly match the document.
+- **BM25** is strong for exact terms such as fighter names, event names, and
+  techniques that may be less prominent in an embedding but are lexically
+  important.
+- **RRF** combines rankings instead of raw scores because cosine similarity
+  and BM25 scores are not directly comparable.
 
-### Kenapa "Graph" (bukan RAG biasa)?
+### Why a graph instead of standard RAG?
 
-RAG biasa hanya mengembalikan potongan teks yang paling mirip dengan
-pertanyaan. Untuk pertanyaan seperti *"bagaimana performa Jon Jones
-belakangan ini?"*, satu dokumen laga saja tidak cukup — perlu **beberapa
-laga terakhir** seorang fighter, terhubung lewat identitas fighter yang
-sama. Knowledge graph di proyek ini menyimpan relasi tersebut secara
-eksplisit sehingga sistem bisa **menelusuri graph** (bukan cuma mencari
-kemiripan teks) untuk melengkapi konteks. Untuk pertanyaan **head-to-head**,
-graph bahkan bisa memberi jawaban **100% eksak** (dihitung, bukan ditebak
-LLM).
+Standard RAG returns text chunks that are most similar to a question. For a
+question such as *"How has Jon Jones performed recently?"*, one fight document
+is not enough; the system needs several recent fights connected to the same
+fighter identity. This knowledge graph stores those relationships explicitly,
+so the system can expand context through graph traversal. For head-to-head
+questions, the graph can provide exact facts instead of asking the LLM to
+calculate or guess them.
 
 ---
 
-## Struktur folder
+## Project structure
 
-```
+```text
 graphrag-ufc/
-├── main.py                  # entrypoint ringkas: `python main.py build|ask`
-├── config.py                # semua path & hyperparameter terpusat
+├── main.py                  # compact entrypoint: `python main.py build|ask`
+├── config.py                # centralized paths and hyperparameters
 ├── requirements.txt
-├── .env.example              # salin ke .env lalu isi GOOGLE_API_KEY
+├── .env.example              # copy to .env and set GOOGLE_API_KEY
 ├── data/
-│   └── master.csv            # dataset UFC (sudah disertakan)
-├── storage/                  # dibuat otomatis oleh build_index.py (index, cache)
+│   └── master.csv            # included UFC dataset
+├── storage/                  # generated by build_index.py (indexes, caches)
 ├── src/
-│   ├── data_loader.py         # CSV -> dokumen teks natural-language
-│   ├── graph_builder.py       # CSV -> knowledge graph + query helper (head-to-head dst.)
-│   ├── embeddings.py          # factory sentence-transformers + cache
+│   ├── data_loader.py         # CSV -> natural-language documents
+│   ├── graph_builder.py       # CSV -> knowledge graph and query helpers
+│   ├── embeddings.py          # sentence-transformers factory and cache
 │   ├── vector_store.py        # build/load FAISS
-│   ├── lexical_retriever.py   # BM25 retriever custom (di atas rank_bm25)
-│   ├── hybrid_retriever.py    # RRF fusion + graph expansion
-│   ├── graph_qa.py            # deteksi & jawab pertanyaan head-to-head eksak
-│   ├── caching.py             # cache L1 (semantic) / L2 (LLM) / L3 (embedding)
-│   └── rag_pipeline.py        # rakit semua jadi satu pipeline tanya-jawab
+│   ├── lexical_retriever.py   # custom BM25 retriever on rank_bm25
+│   ├── hybrid_retriever.py    # RRF fusion and graph expansion
+│   ├── graph_qa.py            # exact head-to-head question handling
+│   ├── caching.py             # L1 semantic / L2 LLM / L3 embedding caches
+│   └── rag_pipeline.py        # complete question-answering pipeline
 └── scripts/
-    ├── build_index.py         # jalankan SEKALI: bangun semua index
-    └── ask.py                 # CLI tanya-jawab (interaktif / sekali tanya)
+    ├── build_index.py         # build all indexes
+    └── ask.py                 # interactive or one-shot CLI questions
 ```
 
 ---
 
-## Instalasi
+## Installation
 
 ```bash
-# 1. Buat virtual environment (disarankan)
+# 1. Create a virtual environment (recommended)
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Siapkan API key Gemini
+# 3. Configure the Gemini API key
 cp .env.example .env
-# lalu edit .env, isi GOOGLE_API_KEY=... (gratis di https://aistudio.google.com/apikey)
+# then edit .env and set GOOGLE_API_KEY=... (get one at https://aistudio.google.com/apikey)
 ```
 
-## Pemakaian
+## Usage
 
 ```bash
-# Langkah 1 - bangun index (sekali saja, atau setiap kali master.csv berubah)
+# Step 1 - build indexes (once, or whenever master.csv changes)
 python main.py build
-# setara dengan: python scripts/build_index.py
+# equivalent to: python scripts/build_index.py
 
-# Langkah 2 - tanya jawab interaktif
+# Step 2 - start interactive Q&A
 python main.py ask
-# setara dengan: python scripts/ask.py
+# equivalent to: python scripts/ask.py
 
-# Atau sekali tanya langsung dari terminal:
-python main.py ask "Bagaimana rekor head to head Jon Jones vs Daniel Cormier?"
+# Or ask one question directly from the terminal:
+python main.py ask "What is the head-to-head record between Jon Jones and Daniel Cormier?"
 ```
 
-> ⚠️ `build_index.py` membuat embedding lokal untuk **±14.000 dokumen**
-> (11.441 laga + ±4.100 profil fighter). Model sentence-transformers perlu
-> diunduh saat pertama kali dipakai dan membutuhkan resource CPU/RAM.
+> `build_index.py` creates embeddings for approximately **14,000 documents**
+> (11,441 fights and approximately 4,100 fighter profiles). The
+> sentence-transformers model is downloaded on first use and requires CPU/RAM.
 
-### Contoh pertanyaan yang bisa dicoba
+### Example questions
 
-- "Siapa itu Khabib Nurmagomedov, bagaimana rekornya?"
-- "Bagaimana rekor head to head Nick Diaz vs KJ Noons?"
-- "Laga apa saja yang berakhir dengan submission armbar di kelas welterweight?"
-- "Bandingkan gaya bertarung Jon Jones dan Daniel Cormier berdasarkan statistik mereka"
-- "Petarung mana yang punya takedown defense terbaik di data ini?"
+- "Who is Khabib Nurmagomedov, and what is his record?"
+- "What is the head-to-head record between Nick Diaz and KJ Noons?"
+- "Which welterweight fights ended with an armbar submission?"
+- "Compare Jon Jones and Daniel Cormier based on their statistics."
+- "Which fighter has the best takedown defense in this dataset?"
 
 ---
 
-## Cache 3 lapis ("canggih")
+## Three-layer cache
 
-| Lapis | Nama | Key | Efek saat hit | File |
-|---|---|---|---|---|
-| **L1** | `SemanticCache` | kemiripan **makna** pertanyaan (cosine similarity embedding, threshold `SEMANTIC_CACHE_THRESHOLD`) | skip retrieval **+** skip panggilan Gemini sepenuhnya | `storage/semantic_cache.pkl` |
-| **L2** | `SQLiteCache` (bawaan LangChain) | **exact match** prompt akhir ke LLM | skip panggilan Gemini (retrieval tetap jalan) | `storage/llm_cache.sqlite` |
-| **L3** | `PersistentCachedEmbeddings` | **exact match** sha256(teks) | skip perhitungan embedding lokal berulang | `storage/embedding_cache.sqlite` |
+| Layer | Name | Key | Effect on hit | File |
+| --- | --- | --- | --- | --- |
+| **L1** | `SemanticCache` | question **meaning** similarity (cosine similarity, `SEMANTIC_CACHE_THRESHOLD`) | skips retrieval and Gemini generation | `storage/semantic_cache.pkl` |
+| **L2** | `SQLiteCache` (LangChain) | exact match of the final LLM prompt | skips Gemini generation; retrieval still runs | `storage/llm_cache.sqlite` |
+| **L3** | `PersistentCachedEmbeddings` | exact `sha256(text)` match | skips repeated local embedding work | `storage/embedding_cache.sqlite` |
 
-L1 paling agresif menghemat biaya (pertanyaan yang mirip walau beda kata
-persis tetap kena cache), sementara L3 membuat `build_index.py` bisa
-di-rerun berkali-kali tanpa membayar ulang embedding untuk dokumen yang
-tidak berubah.
+L1 provides the largest savings because semantically similar questions can hit
+the cache even when their wording differs. L3 allows `build_index.py` to be
+rerun without recomputing embeddings for unchanged documents.
 
-Atur sensitivitas L1 lewat `.env`:
+```bash
+# Configure L1 sensitivity in .env:
+SEMANTIC_CACHE_THRESHOLD=0.94   # higher means stricter matching
 ```
-SEMANTIC_CACHE_THRESHOLD=0.94   # makin tinggi = makin ketat (perlu makin mirip)
-```
 
 ---
 
-## Kustomisasi
+## Customization
 
-- **Ganti model**: ubah `GEMINI_CHAT_MODEL` untuk generation dan
-  `SENTENCE_TRANSFORMER_MODEL` untuk embedding lokal di `.env`.
-- **Ganti dataset**: selama CSV lain punya struktur mirip (fighter merah/biru
-  per baris), cukup ubah `CSV_PATH` di `.env`. Untuk struktur data yang
-  jauh berbeda, sesuaikan `src/data_loader.py` (bentuk teks dokumen) dan
-  `src/graph_builder.py` (skema graph).
-- **Atur jumlah dokumen yang diambil**: `VECTOR_TOP_K`, `BM25_TOP_K`,
-  `HYBRID_TOP_N`, `GRAPH_EXPAND_PER_FIGHTER` di `.env`.
-- **Tambah tipe entitas graph baru** (mis. `referee`, `venue`): tambahkan
-  node/edge baru di `graph_builder.build_knowledge_graph`, lalu manfaatkan
-  di `hybrid_retriever._graph_expand` atau `graph_qa.py`.
-
----
-
-## Keterbatasan & catatan biaya
-
-- Build index awal membuat embedding lokal untuk seluruh dokumen — tidak ada
-  biaya Gemini embedding, tetapi proses membutuhkan waktu CPU/RAM dan download
-  model saat pertama kali berjalan.
-- Deteksi nama fighter di `graph_qa.py` memakai substring/fuzzy match
-  sederhana (`difflib`) — cukup cepat untuk beberapa ribu fighter, tapi
-  bisa keliru untuk nama yang sangat mirip/ambigu. Untuk dataset jauh lebih
-  besar, pertimbangkan multi-pattern matching (mis. Aho–Corasick).
-  Untuk head-to-head, LLM diberi fakta EKSAK dari graph sehingga hasilnya
-  tetap akurat selama nama berhasil terdeteksi.
-- `LLM_TEMPERATURE` default `0.2` (jawaban cenderung faktual/konsisten);
-  naikkan bila ingin gaya jawaban lebih variatif.
-- Ini contoh referensi/starter project, bukan aplikasi produksi siap-pakai —
-  belum ada auth, rate limiting, atau observability untuk trafik banyak
-  pengguna.
+- **Change models**: set `GEMINI_CHAT_MODEL` for generation and
+  `SENTENCE_TRANSFORMER_MODEL` for local embeddings in `.env`.
+- **Change the dataset**: if another CSV has a similar structure, update
+  `CSV_PATH`. For a different schema, update `src/data_loader.py` and
+  `src/graph_builder.py`.
+- **Tune retrieval size**: configure `VECTOR_TOP_K`, `BM25_TOP_K`,
+  `HYBRID_TOP_N`, and `GRAPH_EXPAND_PER_FIGHTER` in `.env`.
+- **Add graph entity types** such as `referee` or `venue` by adding nodes and
+  edges in `graph_builder.build_knowledge_graph`, then using them in
+  `hybrid_retriever._graph_expand` or `graph_qa.py`.
 
 ---
 
-## Troubleshooting / catatan versi
+## Limitations and cost notes
 
-Ekosistem `langchain` bergerak sangat cepat (rilis v1.0 memindahkan banyak
-modul lama — `CacheBackedEmbeddings`, `langchain.retrievers`, dsb — ke
-paket terpisah `langchain-classic`). Proyek ini SENGAJA meminimalkan
-ketergantungan pada modul yang sering berubah:
+- The initial index build creates local embeddings for all documents. There is
+  no Gemini embedding cost, but the process requires CPU/RAM and downloads the
+  model on first use.
+- Fighter detection in `graph_qa.py` uses simple substring/fuzzy matching via
+  `difflib`. Similar or ambiguous names may be detected incorrectly.
+- `LLM_TEMPERATURE` defaults to `0.2` for factual, consistent answers; increase
+  it for more variation.
+- This is a reference/starter project, not a production-ready application. It
+  does not yet include authentication, rate limiting, or observability.
 
-- BM25 dibangun langsung di atas `rank-bm25` (stabil, tidak bergantung
-  modul `langchain.retrievers`).
-- Cache embedding dibuat sendiri (`PersistentCachedEmbeddings`) di atas
-  SQLite biasa, bukan `CacheBackedEmbeddings`.
-- FAISS & `SQLiteCache` tetap memakai `langchain_community` (per versi
-  yang diuji, ini masih berfungsi meski paket tersebut berstatus
-  "sunset"/tidak aktif dikembangkan lagi). Jika suatu saat import ini
-  gagal karena versi LangChain kamu lebih baru, coba:
+---
+
+## Troubleshooting and version notes
+
+The `langchain` ecosystem changes quickly. Version 1.0 moved several older
+modules, including `CacheBackedEmbeddings` and `langchain.retrievers`, into the
+separate `langchain-classic` package. This project intentionally minimizes
+dependencies on frequently changing modules:
+
+- BM25 is built directly on `rank-bm25` instead of `langchain.retrievers`.
+- Embedding caching is implemented with `PersistentCachedEmbeddings` and
+  SQLite instead of `CacheBackedEmbeddings`.
+- FAISS and `SQLiteCache` still use `langchain_community`. If an import fails
+  after a LangChain upgrade, try:
+
   ```bash
   pip install langchain-classic
   ```
-  lalu ganti baris importnya di `src/vector_store.py` /
-  `src/caching.py` menjadi `from langchain_classic...` sesuai pesan error
-  yang muncul (LangChain biasanya memberi petunjuk migrasi yang jelas).
 
-Semua kode di repo ini sudah **diuji berjalan end-to-end** (build index +
-tanya-jawab, termasuk graph expansion & 3 lapis cache) memakai versi paket
-yang tercantum di `requirements.txt`.
+  Then update the imports in `src/vector_store.py` or `src/caching.py` to
+  `from langchain_classic...` as indicated by the error message.
+
+The repository includes tests for prompt behavior and embedding backend
+selection. Run the full application flow after installing the dependencies and
+building the local indexes.
